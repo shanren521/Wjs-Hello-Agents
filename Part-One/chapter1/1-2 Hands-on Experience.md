@@ -203,7 +203,66 @@ for i in range(5): # 设置最大循环次数
     # 3.3 解析并执行成功
     action_match = re.search(f"Action: (.*)", llm_output, re.DOTALL)
     
+    if not action_match:
+        observation = "错误：未能解析到Action字段。请确保你的回复严格遵循 'Thought: ... Action: ...' 的格式。"
+        observation_str = f"Observation: {observation}"
+        print(f"{observation_str}\n" + "="*40)
+        prompt_history.append(observation_str)
+        continue
+    action_str = action_match.group(1).strip()
+    if action_str.startswith("Finish"):
+        final_answer = re.match(r"Finish\[(.*)\]", action_str).group(1)
+        print(f"任务完成，最终答案: {final_answer}")
+        break
     
+    tool_name = re.search(r"(\w+)\(", action_str).group(1)
+    args_str = re.search(r"\((.*)\)", action_str).group(1)
+    kwargs = dict(re.findall(r'(\w+)="([^"]*)"', args_str))
+    
+    if tool_name in available_tools:
+        observation = available_tools[tool_name](**kwargs)
+    else:
+        observation = f"错误:未定义的工具 '{tool_name}'"
+
+    # 3.4 记录观察结果
+    observation_str = f"Observation: {observation}"
+    print(f"{observation_str}\n" + "="*40)
+    prompt_history.append(observation_str)
+```
+
+## 1.2.4 运行案例分析
+```
+用户输入: 你好，请帮我查询一下今天北京的天气，然后根据天气推荐一个合适的旅游景点。
+========================================
+--- 循环 1 ---
+
+正在调用大语言模型...
+大语言模型响应成功。
+模型输出:
+Thought: 首先需要获取北京今天的天气情况，之后再根据天气情况来推荐旅游景点。
+Action: get_weather(city="北京")
+
+Observation: 北京当前天气:Sunny，气温26摄氏度
+========================================      
+--- 循环 2 ---
+
+正在调用大语言模型...
+大语言模型响应成功。
+模型输出:
+Thought: 现在已经知道了北京今天的天气是晴朗且温度适中，接下来可以基于这个信息来推荐一个适合的旅游景点了。
+Action: get_attraction(city="北京", weather="Sunny")
+
+Observation: 北京在晴天最值得去的旅游景点是颐和园，因其美丽的湖景和古建筑。另一个推荐是长城，因其壮观的景观和历史意义。
+========================================
+--- 循环 3 ---
+
+正在调用大语言模型...
+大语言模型响应成功。
+模型输出:
+Thought: 已经获得了两个适合晴天游览的景点建议，现在可以根据这些信息给用户提供满意的答复。
+Action: Finish[今天北京的天气是晴朗的，气温26摄氏度，非常适合外出游玩。我推荐您去颐和园欣赏美丽的湖景和古建筑，或者前往长城体验其壮观的景观和深厚的历史意义。希望您有一个愉快的旅行！]
+
+任务完成，最终答案: 今天北京的天气是晴朗的，气温26摄氏度，非常适合外出游玩。我推荐您去颐和园欣赏美丽的湖景和古建筑，或者前往长城体验其壮观的景观和深厚的历史意义。希望您有一个愉快的旅行！
 ```
 
 
