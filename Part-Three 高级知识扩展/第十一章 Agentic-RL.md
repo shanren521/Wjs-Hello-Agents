@@ -109,6 +109,550 @@ $$
   这种能力使得智能体能够在没有人工干预的情况下持续改进，类似于人类的"从错误中学习"。
 + **感知(Perception)** 是指理解多模态信息的能力。例如，强化学习可以提升视觉推理能力，让模型学会使用视觉工具，学会视觉规划。这使得智能体不仅能理解文本，还能理解和操作视觉世界。
 
+### 11.1.4 HelloAgents的Agentic RL设计
+在技术选型上，我们集成了 TRL(Transformer Reinforcement Learning)框架[9]，模型选择 Qwen3-0.6B[10]。TRL 是 Hugging Face 的强化学习库，成熟稳定、功能完整、易于集成。
+Qwen3-0.6B 是阿里云的小型语言模型，0.6B 参数适合普通 GPU 训练，性能优秀且开源免费。
+
+![HelloAgents Agentic RL 架构.png](../images/HelloAgents%20Agentic%20RL%20架构.png)
+
+最底层是数据集层，包含GSM8KDataset类、create_sft_dataset()函数和create_rl_dataset()函数，负责数据加载和格式转换。
+第二层是奖励函数层，包含MathRewardFunction基类、AccuracyReward准确率奖励、LengthPenaltyReward长度惩罚、StepReward步骤奖励，以及便捷创建函数create_*_reward()，负责定义什么是好的行为。
+第三层是训练器层，包含SFTTrainerWrapper和GRPOTrainerWrapper，负责具体的训练逻辑和 LoRA 支持。最顶层是统一接口层，提供RLTrainingTool统一训练工具，支持四种操作:action="train"(训练模型)、action="load_dataset"(加载数据集)、action="create_reward"(创建奖励函数)、action="evaluate"(评估模型)。
+
+### 11.1.5 快速上手示例
+
+```bash
+# 安装HelloAgents框架(第11章版本)
+pip install "hello-agents[rl]==0.2.5"
+
+# 或者从源码安装
+cd HelloAgents
+pip install -e ".[rl]"
+```
+代码：
+```python
+import sys
+import json
+
+from hello_agents.tools import RLTrainingTool
+
+# 创建RL训练工具
+rl_tool = RLTrainingTool()
+
+# 1.快速测试：SFT训练(10个样本，1个epoch)
+sft_result_str = rl_tool.run({
+    "action": "train",
+    "algorithm": "sft",
+    "model_name": "Qwen/Qwen3-0.6B",
+    "output_dir": "./models/quick_test_sft",
+    "max_samples": 10,      # 只用10个样本快速测试
+    "num_epochs": 1,        # 只训练1轮
+    "batch_size": 2,
+    "use_lora": True        # 使用LoRA加速训练
+})
+
+sft_result = json.loads(sft_result_str)
+print(f"\n SFT训练完成，模型保存在: {sft_result['output_dir']}")
+
+# 2.GRPO训练(5个样本，1个epoch)
+grpo_result_str = rl_tool.run({
+    "action": "train",
+    "algorithm": "grpo",
+    "model_name": "Qwen/Qwen3-0.6B",  # 使用基础模型
+    "output_dir": "./models/quick_test_grpo",
+    "max_samples": 5,       # 只用5个样本快速测试
+    "num_epochs": 1,
+    "batch_size": 2,        # 必须能被num_generations(8)整除,使用2
+    "use_lora": True
+})
+
+grpo_result = json.loads(grpo_result_str)
+print(f"\n GRPO训练完成，模型保存在：{grpo_result['output_dir']}")
+
+# 3.评估模型
+eval_result_str = rl_tool.run({
+    "action": "evaluate",
+    "model_path": "./models/quick_test_grpo",
+    "max_samples": 10,      # 在10个测试样本上评估
+    "use_lora": True
+})
+
+eval_result = json.loads(eval_result_str)
+print(f"\n✓ 评估完成:")
+print(f"  - 准确率: {eval_result['accuracy']}")
+print(f"  - 平均奖励: {eval_result['average_reward']}")
+print(f"  - 测试样本数: {eval_result['num_samples']}")
+
+print("\n" + "=" * 50)
+print("🎉 恭喜!你已经完成了第一个Agentic RL模型的训练!")
+print("=" * 50)
+print(f"\n模型路径:")
+print(f"  SFT模型: {sft_result['output_dir']}")
+print(f"  GRPO模型: {grpo_result['output_dir']}")
+
+```
+
+## 11.2 数据集与奖励函数
+### 11.2.1 GSM8K数学推理数据集
+
+数学推理是评估 LLM 推理能力的理想任务。
+
+首先，数学问题有明确的正确答案，可以自动评估，不需要人工标注或复杂的奖励模型。
+
+其次，解决数学问题需要分解问题、逐步推导，这正是多步推理的典型场景。
+
+最后，学到的推理能力可以迁移到其他领域，具有很强的泛化性
+
+![GSM8K 数据集统计.png](../images/GSM8K%20数据集统计.png)
+
+典型的GSM8K问题：
+```bash
+问题: Natalia sold clips to 48 of her friends in April, and then she sold half 
+      as many clips in May. How many clips did Natalia sell altogether in April 
+      and May?
+
+答案: Natalia sold 48/2 = <<48/2=24>>24 clips in May.
+      Natalia sold 48+24 = <<48+24=72>>72 clips altogether in April and May.
+      #### 72
+
+最终答案: 72
+```
+
+GSM8K 数据集需要转换为不同的格式，以适应不同的训练方法
+![GSM8K 数据格式转换.png](../images/GSM8K%20数据格式转换.png)
+
+原始格式直接来自数据集，包含问题(question)和答案(answer，含解题步骤)，适合人类阅读。SFT格式用于监督微调，将问题转换为对话格式的prompt，
+将完整解答作为completion。
+
+```bash
+{
+    "prompt": "<|im_start|>user\nNatalia sold clips to 48 of her friends...<|im_end|>\n<|im_start|>assistant\n",
+    "completion": "Let me solve this step by step.\n\nStep 1: ...\n\nFinal Answer: 72<|im_end|>"
+}
+```
+
+关键点是使用模型的对话模板(如 Qwen 的<|im_start|>标记)，prompt 包含用户问题，completion 包含完整的解题过程和答案。这样模型可以学习如何格式化输出、如何分步推理。
+
+RL 格式用于强化学习，只提供问题和正确答案，不提供解题过程。
+```bash
+{
+    "prompt": "<|im_start|>user\nNatalia sold clips to 48 of her friends...<|im_end|>\n<|im_start|>assistant\n",
+    "ground_truth": "72"
+}
+```
+
+关键点是 prompt 与 SFT 相同，但 ground_truth 只包含最终答案(用于计算奖励)，模型需要自己生成完整的推理过程。这种设计迫使模型学会自主推理，而不是简单地记忆答案。
+
+![三种数据格式对比.png](../images/三种数据格式对比.png)
+
+```python
+from hello_agents.tools import RLTrainingTool
+import json
+
+# 创建工具
+rl_tool = RLTrainingTool()
+
+# 1.加载SFT格式数据集
+sft_result = rl_tool.run({
+    "action": "load_dataset",
+    "format": "sft",
+    "max_samples": 5  # 只加载5个样本查看
+})
+sft_data = json.loads(sft_result)
+
+print(f"数据集大小: {sft_data['dataset_size']}")
+print(f"数据格式: {sft_data['format']}")
+print(f"样本字段: {sft_data['sample_keys']}")
+
+# 2. 加载RL格式数据集
+rl_result = rl_tool.run({
+    "action": "load_dataset",
+    "format": "rl",
+    "max_samples": 5
+})
+rl_data = json.loads(rl_result)
+
+print(f"数据集大小: {rl_data['dataset_size']}")
+print(f"数据格式: {rl_data['format']}")
+print(f"样本字段: {rl_data['sample_keys']}")
+```
+
+### 11.2.2奖励函数设计
+
+在强化学习中，奖励函数 $r(s, a)$ 或 $r(s, a, s')$ 为智能体的每个行动分配一个数值奖励。
+智能体的目标是最大化累积奖励：
+
+$$
+J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=0}^{T} \gamma^t r(s_t, a_t) \right]
+$$
+
+对于数学推理任务，我们可以简化为：
+
+$$
+r(q, a) = f(a, a^*)
+$$
+
+其中q是问题，a是模型生成的答案，$a^*$，$\mathcal{f}$是评估函数。
+
+奖励函数的设计直接影响训练效果。好的奖励函数应该能清楚地定义什么是成功、能够提供梯度信号、不会产生过大的方差、容易调整和组合。
+糟糕的奖励函数可能只在任务结束时给奖励，中间步骤无反馈、存在奖励欺骗，使得智能体找到"作弊"方式获得高奖励、多个目标相互矛盾、方差过大，训练不收敛。
+
+HelloAgents 提供了三种内置奖励函数，可以单独使用或组合使用
+
+![HelloAgents的三种奖励函数设计](../images/HelloAgents的三种奖励函数设计.png)
+
+#### (1) 准确率奖励
+
+准确率奖励(AccuracyReward)是最基础的奖励函数，它只关心答案是否正确。数学定义为:
+
+$$
+r_{\text{acc}}(a, a^*) = \begin{cases} 1 & \text{if } a = a^* \\ 0 & \text{otherwise} \end{cases}
+$$
+
+其中a是模型生成的答案，$a^*$是正确答案。这是一个二值奖励函数，答案正确得 1 分，错误得 0 分。
+
+实现时需要处理答案提取和比较。模型的输出可能包含大量文本，我们需要提取最终答案。常见的提取方法包括:查找"Final Answer:"后的数字、查找"####"标记后的数字、使用正则表达式提取最后一个数字。
+答案比较时需要处理数值精度(如 72.0 和 72 应该视为相同)、单位转换(如 1000 和 1k)、格式差异(如"72"和"seventy-two")。
+
+示例：
+```python
+from hello_agents.tools import RLTrainingTool
+import json
+rl_tool = RLTrainingTool()
+
+# 创建准确率奖励函数
+reward_result = rl_tool.run({
+    "action": "create_reward",
+    "reward_type": "accuracy"
+})
+reward_data = json.loads(reward_result)
+
+print(f"奖励类型: {reward_data['reward_type']}")
+print(f"描述: {reward_data['description']}")
+
+# 注意: RLTrainingTool的create_reward操作返回的是配置信息,
+# 实际的奖励函数会在训练时自动创建和使用
+```
+
+**准确率奖励的优点**是简单直接，容易理解和实现，适合有明确正确答案的任务。**缺点**是奖励稀疏，只有答案完全正确才有奖励，无法区分"接近正确"和"完全错误"，可能导致训练初期缺乏有效反馈。
+
+#### (2) 长度惩罚
+长度惩罚(LengthPenaltyReward)鼓励模型生成简洁的回答，避免冗长啰嗦。数学定义为:
+
+$$
+r_{\text{length}}(a, a^*, l) = r_{\text{acc}}(a, a^*) - \alpha \cdot \max(0, l - l_{\text{target}})
+$$
+
+其中l是生成文本的长度(字符数或 token 数)，$l_{target}$是目标长度，$\alpha$是惩罚系数(默认 0.001)。只有在答案正确的情况下才应用长度惩罚，避免模型为了减少惩罚而生成错误的短答案。
+
+设计思路是:如果答案错误，奖励为 0(无论长度);如果答案正确且长度合理，奖励为 1;如果答案正确但过长，奖励为$1 - \alpha · (l - l_{target})$。
+例如，目标长度 200 字符，实际长度 500 字符，惩罚系数 0.001，则奖励为 1 - 0.001 * (500 - 200) = 0.7
+
+示例：
+```python
+# 创建长度惩罚奖励函数
+reward_result = rl_tool.run({
+    "action": "create_reward",
+    "reward_type": "length_penalty",
+    "max_length": 1024,      # 最大长度
+    "penalty_weight": 0.001  # 惩罚权重
+})
+reward_data = json.loads(reward_result)
+
+print(f"奖励类型: {reward_data['reward_type']}")
+print(f"描述: {reward_data['description']}")
+print(f"最大长度: {reward_data['max_length']}")
+print(f"惩罚权重: {reward_data['penalty_weight']}")
+```
+
+**长度惩罚的优点**是鼓励简洁表达，避免模型生成冗余内容，可以控制推理成本(更短的输出意味着更少的 token 消耗)。**缺点**是可能抑制详细推理，需要仔细调整惩罚系数，不同任务的最优长度差异很大。
+
+#### (3) 步骤奖励
+步骤奖励(StepReward)鼓励模型生成清晰的推理步骤，提高可解释性。数学定义为:
+
+$$
+r_{\text{step}}(a, a^*, s) = r_{\text{acc}}(a, a^*) + \beta \cdot s
+$$
+
+其中s是检测到的推理步骤数量, $\beta$步骤奖励系数(默认0.1)。同样，只有在答案正确的情况下才给予步骤奖励。
+
+步骤检测方法包括:查找"Step 1:"， "Step 2:"等标记、查找换行符数量、使用正则表达式匹配推理模式。例如，一个包含 3 个清晰步骤的正确答案，奖励为1 + 0.1 * 3 = 1.3
+
+示例：
+```python
+# 创建步骤奖励函数
+reward_result = rl_tool.run({
+    "action": "create_reward",
+    "reward_type": "step",
+    "step_bonus": 0.1  # 每个步骤奖励0.1
+})
+reward_data = json.loads(reward_result)
+
+print(f"奖励类型: {reward_data['reward_type']}")
+print(f"描述: {reward_data['description']}")
+print(f"步骤奖励: {reward_data['step_bonus']}")
+```
+
+**步骤奖励的优点**是鼓励可解释的推理，生成的答案更容易验证和调试，有助于模型学习系统化的思考方式。**缺点**是可能导致模型为了获得更多奖励生成冗余步骤，需要平衡步骤数量和答案质量，步骤检测可能不准确。
+
+在实际应用中，我们通常会组合多个奖励函数，以平衡不同的目标。常见的组合策略包括:
+
+**准确率** + **长度惩罚**:鼓励简洁正确的答案，适合对话系统、问答系统。公式为:
+$$
+r = r_{\text{acc}} - \alpha \cdot \max(0, l - l_{\text{target}})
+$$
+
+**准确率 + 步骤奖励**：鼓励详细的推理过程，适合教育场景、可解释 AI。公式为：
+$$
+r = r_{\text{acc}} + \beta \cdot s
+$$
+
+**三者平衡**：全面优化答案质量、简洁性和可解释性。公式为：
+$$
+r = r_{\text{acc}} - \alpha \cdot \max(0, l - l_{\text{target}}) + \beta \cdot s
+$$
+
+需要仔细调整权重 $\alpha$ 和 $\beta$，避免某个目标过度主导。
+
+示例：
+```python
+# 组合奖励函数:准确率 + 长度惩罚 + 步骤奖励
+# 注意: RLTrainingTool目前支持单一奖励类型
+# 组合奖励需要在训练配置中通过reward_fn参数指定
+# 这里展示如何配置不同类型的奖励函数
+
+# 准确率奖励
+accuracy_result = rl_tool.run({
+    "action": "create_reward",
+    "reward_type": "accuracy"
+})
+print("准确率奖励:", json.loads(accuracy_result)['description'])
+
+# 长度惩罚奖励
+length_result = rl_tool.run({
+    "action": "create_reward",
+    "reward_type": "length_penalty",
+    "max_length": 1024,
+    "penalty_weight": 0.001
+})
+print("长度惩罚奖励:", json.loads(length_result)['description'])
+
+# 步骤奖励
+step_result = rl_tool.run({
+    "action": "create_reward",
+    "reward_type": "step",
+    "step_bonus": 0.1
+})
+print("步骤奖励:", json.loads(step_result)['description'])
+```
+
+不同奖励函数适合不同的应用场景。
+
+![奖励函数对比.png](../images/奖励函数优点缺点适用场景.png)
+
+### 11.2.3 自定义数据集和奖励函数
+
+**SFT 格式**:用于监督微调，需要包含以下字段:
++ prompt: 输入提示(包含 system 和 user 消息)
++ completion: 期望的输出
++ text: 完整的对话文本(可选)
+
+**RL 格式**:用于强化学习，需要包含以下字段:
++ question: 原始问题
++ prompt: 输入提示(包含 system 和 user 消息)
++ ground_truth: 正确答案
++ full_answer: 完整答案(包含推理过程)
+
+#### (1) 使用 format_math_dataset 转换
+
+```python
+from datasets import Dataset
+from hello_agents.rl import format_math_dataset
+
+# 1. 准备原始数据
+custom_data = [
+    {
+        "question": "What is 2+2?",
+        "answer": "2+2=4. #### 4"
+    },
+    {
+        "question": "What is 5*3?",
+        "answer": "5*3=15. #### 15"
+    },
+    {
+        "question": "What is 10+7?",
+        "answer": "10+7=17. #### 17"
+    }
+]
+
+# 2.转换为Dataset对象
+raw_dataset = Dataset.from_list(custom_data)
+
+# 3.转换为SFT对象
+sft_dataset = format_math_dataset(
+    dataset=raw_dataset,
+    format_type="sft",
+    model_name="Qwen/Qwen3-0.6B"
+)
+print(f"SFT数据集：{len(sft_dataset)}个样本")
+print(f"字段: {sft_dataset.column_names}")
+
+# 4. 转换为RL格式
+rl_dataset = format_math_dataset(
+    dataset=raw_dataset,
+    format_type="rl",
+    model_name="Qwen/Qwen3-0.6B"
+)
+
+print(f"RL数据集: {len(rl_dataset)}个样本")
+print(f"字段: {rl_dataset.column_names}")
+
+```
+
+#### (2) 直接传入自定义的数据集
+
+使用 RLTrainingTool 时，可以通过custom_dataset参数直接传入自定义数据集:
+```python
+from hello_agents.tools import RLTrainingTool
+
+rl_tool = RLTrainingTool()
+
+# SFT训练
+result = rl_tool.run({
+    "action": "train",
+    "algorithm": "sft",
+    "model_name": "Qwen/Qwen3-0.6B",
+    "output_dir": "./models/custom_sft",
+    "num_epochs": 3,
+    "batch_size": 4,
+    "use_lora": True,
+    "custom_dataset": sft_dataset  # 直接传入自定义数据集
+})
+
+# GRPO训练
+result = rl_tool.run({
+    "action": "train",
+    "algorithm": "grpo",
+    "model_name": "Qwen/Qwen3-0.6B",
+    "output_dir": "./models/custom_grpo",
+    "num_epochs": 2,
+    "batch_size": 2,
+    "use_lora": True,
+    "custom_dataset": rl_dataset  # 直接传入自定义数据集
+})
+```
+
+#### (3) 注册自定义数据集(推荐)
+对于需要多次使用的数据集，推荐使用注册方式:
+```bash
+# 1. 注册数据集
+rl_tool.register_dataset("my_math_dataset", rl_dataset)
+
+# 2. 使用注册的数据集
+result = rl_tool.run({
+    "action": "train",
+    "algorithm": "grpo",
+    "dataset": "my_math_dataset",  # 使用注册的数据集名称
+    "output_dir": "./models/custom_grpo",
+    "num_epochs": 2,
+    "use_lora": True
+})
+```
+奖励函数用于评估模型生成的答案质量。自定义奖励函数需要遵循以下签名:
+
+```python
+from typing import List
+import re
+
+def custom_reward_function(
+    completions: List[str],
+    **kwargs
+) -> List[float]:
+    """
+    自定义奖励函数
+
+    Args:
+        completions: 模型生成的完成文本列表
+        **kwargs: 其他参数,通常包含:
+            - ground_truth: 正确答案列表
+            - 其他数据集字段
+
+    Returns:
+        奖励值列表(每个值在0.0-1.0之间)
+    """
+    ground_truths = kwargs.get("ground_truth", [])
+    rewards = []
+
+    for completion, truth in zip(completions, ground_truths):
+        reward = 0.0
+
+        # 提取答案
+        numbers = re.findall(r'-?\d+\.?\d*', completion)
+        if numbers:
+            try:
+                pred = float(numbers[-1])
+                truth_num = float(truth)
+                error = abs(pred - truth_num)
+
+                # 根据误差给予不同奖励
+                if error < 0.01:
+                    reward = 1.0  # 完全正确
+                elif error < 1.0:
+                    reward = 0.8  # 非常接近
+                elif error < 5.0:
+                    reward = 0.5  # 接近
+
+                # 额外奖励:鼓励展示推理步骤
+                if "step" in completion.lower() or "=" in completion:
+                    reward += 0.1
+
+            except ValueError:
+                reward = 0.0
+
+        rewards.append(min(reward, 1.0))  # 限制最大值为1.0
+
+    return rewards
+```
+
+#### (1) 直接传入
+```python
+result = rl_tool.run({
+    "action": "train",
+    "algorithm": "grpo",
+    "model_name": "Qwen/Qwen3-0.6B",
+    "output_dir": "./models/custom_grpo",
+    "custom_dataset": rl_dataset,
+    "custom_reward": custom_reward_function  # 直接传入奖励函数
+})
+```
+
+#### (2) 注册使用(推荐)
+```python
+# 1. 注册奖励函数
+rl_tool.register_reward_function("my_reward", custom_reward_function)
+
+# 2. 使用注册的奖励函数
+result = rl_tool.run({
+    "action": "train",
+    "algorithm": "grpo",
+    "dataset": "my_math_dataset",
+    "output_dir": "./models/custom_grpo"
+    # 奖励函数会自动使用与dataset同名的注册函数
+})
+```
+
+## 11.3 SFT训练
+
+监督微调(Supervised Fine-Tuning， SFT)是强化学习训练的第一步，也是最重要的基础。SFT 让模型学习任务的基本格式、对话模式和初步的推理能力。没有 SFT 的基础，直接进行强化学习往往会失败，因为模型连基本的输出格式都不会。
+
+### 11.3.1 为什么需要SFT
+
+
+
+
+
+
+
 
 
 
