@@ -647,6 +647,126 @@ result = rl_tool.run({
 
 ### 11.3.1 为什么需要SFT
 
+```python
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# 加载预训练模型
+model_name = "Qwen/Qwen3-0.6B"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(model_name)
+
+# 测试问题
+question = """Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?"""
+
+# 构造输入
+prompt = f"<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+inputs = tokenizer(prompt, return_tensors="pt")
+
+# 生成回答
+outputs = model.generate(**inputs, max_new_tokens=200)
+response = tokenizer.decode(outputs[0], skip_special_tokens=False)
+
+print("预训练模型的回答:")
+print(response)
+```
+
+![SFT 在训练流程中的作用.png](../images/SFT%20在训练流程中的作用.png)
+
+### 11.3.2 LoRA:参数高效微调
+
+直接微调整个模型需要大量的计算资源和显存。
+
+对于 Qwen3-0.6B(0.6B 参数)，全量微调需要约 12GB 显存(FP16)或 24GB 显存(FP32)。对于更大的模型(如 7B、13B)，全量微调几乎不可能在消费级 GPU 上进行。
+
+LoRA(Low-Rank Adaptation)[3]是一种参数高效微调方法，它只训练少量的额外参数，而保持原模型参数冻结。
+**LoRA 的核心思想**是:模型微调时的参数变化可以用低秩矩阵表示。
+
+假设原模型的权重矩阵为 $W \in \mathbb{R}^{d \times k}$，微调后的权重为 $W' = W + \Delta W$。LoRA 假设 $\Delta W$ 可以分解为两个低秩矩阵的乘积：
+
+$$
+\Delta W = BA
+$$
+
+其中 $B \in \mathbb{R}^{d \times r}$, $A \in \mathbb{R}^{r \times k}$, $r \ll \min(d, k)$ 是秩(rank)。
+
+前向传播时，输出为：
+
+$$
+h = Wx + \Delta Wx = Wx + BAx
+$$
+
+原模型参数 $W$ 保持冻结，只训练 $B$ 和 $A$。
+
+参数量对比：原模型参数量为 $d \times k$，LoRA 参数量为 $d \times r + r \times k = r(d + k)$。当 $r \ll \min(d, k)$ 时，
+LoRA 参数量远小于原模型。例如，对于 $d = 4096, k = 4096, r = 8$ 的情况，原模型参数量为 $4096 \times 4096 = 16,777,216$，
+LoRA 参数量为 $8 \times (4096 + 4096) = 65,536$，参数量减少了 256 倍！
+
+**LoRA 的优势**:显存占用大幅降低、训练速度更快、易于部署、防止过拟合。**缺点是**训练的效果通常情况会比全量调参更差一些。
+
+![ LoRA vs 全量微调对比.png](../images/LoRA%20vs%20全量微调对比.png)
+
+**全量微调 = 模型权重 + 优化器状态 + 梯度 + 激活值**
++ 模型权重：0.6B 参数在 FP32 精度下约 0.6B × 4Byte = 2.4GB
++ 优化器状态（如 AdamW）：约是权重的 2 倍 → 4.8GB
++ 梯度：和权重大小一致 → 2.4GB
++ 激活值 / 中间计算：根据 batch size 和序列长度，通常再占 2~4GB
+合计：2.4 + 4.8 + 2.4 + 2.4 ≈ 12GB，和表中数据完全吻合
+
+LoRA 的关键超参数包括：
+- **秩(rank, r)**：控制 LoRA 矩阵的秩，秩越大模型表达能力越强，但参数量也随之增加。典型取值范围为 4-64，默认值为 8。
+- **Alpha($\alpha$)**：LoRA 的缩放因子，实际权重更新量为 $\Delta W = \frac{\alpha}{r}BA$，用于控制 LoRA 模块对原模型的影响强度，典型取值等于秩（rank）。
+- **目标模块(target_modules)**：指定在模型哪些层应用 LoRA 微调。通常选择注意力层的 **q_proj、k_proj、v_proj、o_proj**，也可包含 MLP 层的 **gate_proj、up_proj、down_proj**。
+
+### 11.3.3 SFT训练实战
+
+完整的训练流程包括:准备数据集、配置 LoRA、设置训练参数、开始训练、保存模型。
+
+基础训练示例:
+```python
+from hello_agents.tools import RLTrainingTool
+
+# 创建训练工具
+rl_tool = RLTrainingTool()
+
+# SFT训练
+result = rl_tool.run({
+    # 训练配置
+    "action": "train",
+    "algorithm": "sft",
+    
+    # 模型配置
+    "model_name": "Qwen/Qwen3-0.6B",
+    "output_dir": "./models/sft_model",
+    
+    # 数据配置
+    "max_samples": 100,     # 使用100个样本快速测试
+    
+    # 训练参数
+    "num_epochs": 3,        # 训练3轮
+    "batch_size": 4,        # 批次大小
+    "learning_rate": 5e-5,  # 学习率
+    
+    # LoRA配置
+    "use_lora": True,       # 使用LoRA
+    "lora_rank": 8,         # LoRA秩
+    "lora_alpha": 16,       # LoRA alpha
+})
+
+print(f"\n✓ 训练完成!")
+print(f"  - 模型保存路径: {result['model_path']}")
+print(f"  - 训练样本数: {result['num_samples']}")
+print(f"  - 训练轮数: {result['num_epochs']}")
+print(f"  - 最终损失: {result['final_loss']:.4f}")
+```
+
+#### (1) 训练参数详解
+**数据参数**
++ max_samples: 使用的训练样本数量。快速测试时可以用 100-1000 个样本，完整训练建议使用全部数据(7473 个样本)。更多数据通常带来更好的效果，但训练时间也更长。
++ split: 数据集划分，默认"train"。可以设置为"train[:1000]"只使用前 1000 个样本。
+
+
+
+
 
 
 
