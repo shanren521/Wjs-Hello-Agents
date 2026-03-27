@@ -764,6 +764,327 @@ print(f"  - 最终损失: {result['final_loss']:.4f}")
 + max_samples: 使用的训练样本数量。快速测试时可以用 100-1000 个样本，完整训练建议使用全部数据(7473 个样本)。更多数据通常带来更好的效果，但训练时间也更长。
 + split: 数据集划分，默认"train"。可以设置为"train[:1000]"只使用前 1000 个样本。
 
+**训练参数**：
++ num_epoch: 训练轮数。1 轮表示遍历整个数据集一次。太少(1-2 轮)可能欠拟合，太多(>10 轮)可能过拟合。建议从 3 轮开始，观察损失曲线调整。
++ batch_size: 每次更新使用的样本数。越大训练越稳定，但显存占用越高。建议根据显存调整:4GB 显存用 batch_size=1-2，8GB 显存用 batch_size=4-8，16GB 显存用 batch_size=8-16。
++ learning_rate: 学习率，控制参数更新的步长。太小(1e-6)收敛慢，太大(1e-3)可能不收敛。SFT 推荐 5e-5，LoRA 可以稍大(1e-4)。
+
+**LoRA参数**:
++ use_lora: 是否使用 LoRA。建议始终开启，除非有充足的显存。
++ lora_rant: LoRA 秩，控制表达能力。4-8 适合小任务，16-32 适合复杂任务，64 适合大规模微调。
++ lora_alpha: LoRA 缩放因子，通常设置为 rank 的 2 倍。rank=8 时，alpha=16;rank=16 时，alpha=32。
+
+**优化器参数**:
++ optimizer: 优化器类型，默认"adamw"。AdamW 是最常用的选择，也可以尝试"sgd"或"adafactor"等。
++ weight_decay: 权重衰减，防止过拟合。默认 0.01，可以尝试 0.001-0.1。
++ warmup_ratio: 学习率预热比例。前 warmup_ratio 的步数学习率线性增加，然后线性衰减。默认 0.1(前 10%步数预热)。
+
+#### (2) 完整训练示例
+
+```python
+from hello_agents.tools import RLTrainingTool
+
+
+from hello_agents.tools import RLTrainingTool
+
+rl_tool = RLTrainingTool()
+
+# 完整SFT训练
+result = rl_tool.run({
+    "action": "train",
+    "algorithm": "sft",
+
+    # 模型配置
+    "model_name": "Qwen/Qwen3-0.6B",
+    "output_dir": "./models/sft_full",
+
+    # 数据配置
+    "max_samples": None,    # 使用全部数据(7473个样本)
+
+    # 训练参数
+    "num_epochs": 3,
+    "batch_size": 8,
+    "learning_rate": 5e-5,
+    "warmup_ratio": 0.1,
+    "weight_decay": 0.01,
+
+    # LoRA配置
+    "use_lora": True,
+    "lora_rank": 16,        # 使用更大的rank
+    "lora_alpha": 32,
+    "lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+
+    # 其他配置
+    "save_steps": 500,      # 每500步保存一次
+    "logging_steps": 100,   # 每100步记录一次
+    "eval_steps": 500,      # 每500步评估一次
+})
+
+print(f"训练完成! 模型保存在: {result['model_path']}")
+```
+
+#### (3) 训练监控和调试
+
+训练过程中，要监控三个关键指标。
++ **损失(Loss)**：应该逐渐下降，如果不下降可能是学习率太小或数据有问题，如果下降后又上升则可能是学习率太大或出现过拟合。
++ **梯度范数(Gradient Norm)**：应该在 0.1-10 的合理范围内，过大(>100)说明出现梯度爆炸需要降低学习率，过小(<0.01)说明梯度消失需要检查模型配置。
++ **学习率(Learning Rate)**：应该按照 warmup 策略变化，前 10%步数线性增加，然后线性衰减到 0。
+
+训练过程中，常见的问题及解决方案:
++ 显存不足时可以减小 batch_size 或 max_length，使用梯度累积或更小的模型
++ 训练速度慢时可以增大 batch_size，减少 logging 频率，或使用混合精度训练
++ 损失不下降时可以增大学习率，检查数据格式，或增加训练轮数
++ 过拟合时可以增大 weight_decay，减少训练轮数，或使用更多数据
+
+### 11.3.4 模型评估
+
+模型评估指标：
++ **准确率(Accuracy)**：答案完全正确的比例，最直接的指标，范围 0-1，越高越好
++ **平均奖励(Average Reward)**: 所有样本的平均奖励，综合考虑准确率、长度、步骤等因素，范围取决于奖励函数设计。
++ **推理质量(Reasoning Quality)**: 推理过程的清晰度和逻辑性，需要人工评估或使用专门的评估模型。
+```python
+from hello_agents.tools import RLTrainingTool
+
+rl_tool = RLTrainingTool()
+
+# 评估SFT模型
+eval_result = rl_tool.run({
+    "action": "evaluate",
+    "model_path": "./models/sft_full",
+    "max_samples": 100,     # 在100个测试样本上评估
+    "use_lora": True,
+})
+
+eval_data = json.loads(eval_result)
+print(f"\n评估结果:")
+print(f"  - 准确率: {eval_data['accuracy']}")
+print(f"  - 平均奖励: {eval_data['average_reward']}")
+print(f"  - 测试样本数: {eval_data['num_samples']}")
+```
+
+## 11.4 GRPO 训练
+
+### 11.4.1 从PPO到GRPO
+
+在强化学习领域，PPO(Proximal Policy Optimization)[1]是最经典的算法之一。PPO 通过限制策略更新的幅度，保证训练的稳定性
+
+PPO 在 LLM 训练中存在一些问题:需要训练 Value Model(价值模型)，增加了训练复杂度和显存占用;需要同时维护四个模型(Policy Model、Reference Model、Value Model、Reward Model)，工程实现复杂;训练不稳定，容易出现奖励崩塌或策略退化。
+
+GRPO(Group Relative Policy Optimization)[2]是一种简化的 PPO 变体，专门为 LLM 设计。
+
+GRPO的核心思想：不需要 Value Model，使用组内相对奖励代替绝对奖励;简化训练流程，只需要 Policy Model 和 Reference Model;提高训练稳定性，减少奖励崩塌的风险。
+
+PPO 通过限制策略更新的幅度，保证训练的稳定性。但是，PPO 在 LLM 训练中存在一些问题:需要训练 Value Model(价值模型)，增加了训练复杂度和显存占用;
+需要同时维护四个模型(Policy Model、Reference Model、Value Model、Reward Model)，工程实现复杂;训练不稳定，容易出现奖励崩塌或策略退化。
+
+GRPO(Group Relative Policy Optimization)[2]是一种简化的 PPO 变体，专门为 LLM 设计。GRPO的核心思想是：
++ 不需要 Value Model，使用组内相对奖励代替绝对奖励;简化训练流程，只需要 Policy Model 和 Reference Model;提高训练稳定性，减少奖励崩塌的风险。
+
+让我们通过数学公式来理解 GRPO 的原理。PPO 的目标函数为：
+
+$$
+J_{\text{PPO}}(\theta) = \mathbb{E}_{s, a \sim \pi_\theta} \left[ \min \left( \frac{\pi_\theta(a|s)}{\pi_{\text{old}}(a|s)} A(s, a), \text{clip} \left( \frac{\pi_\theta(a|s)}{\pi_{\text{old}}(a|s)}, 1 - \epsilon, 1 + \epsilon \right) A(s, a) \right) \right]
+$$
+
+其中 $A(s, a)$ 是优势函数(Advantage)，需要 Value Model 来估计：
+
+$$
+A(s, a) = Q(s, a) - V(s) = r(s, a) + \gamma V(s') - V(s)
+$$
+
+GRPO 的目标函数简化为：
+
+$$
+J_{\text{GRPO}}(\theta) = \mathbb{E}_{s, a \sim \pi_\theta} \left[ \frac{\pi_\theta(a|s)}{\pi_{\text{ref}}(a|s)} \cdot (r(s, a) - \bar{r}_{\text{group}}) \right] - \beta \cdot D_{KL}(\pi_\theta || \pi_{\text{ref}})
+$$
+
+其中 $\bar{r}_{\text{group}}$ 是组内平均奖励，$\beta$ 是 KL 散度惩罚系数。关键区别在于：GRPO 使用
+$r(s, a) - \bar{r}_{\text{group}}$ 代替优势函数 $A(s, a)$，不需要 Value Model；GRPO 使用组内
+相对奖励，减少奖励方差；GRPO 添加 KL 散度惩罚，防止策略偏离太远。
+
+![PPO vs GRPO 训练流程.png](../images/PPO%20vs%20GRPO%20训练流程.png)
+
+![PPO vs GRPO 对比.png](../images/PPO%20vs%20GRPO%20对比.png)
+
+对于 LLM 训练，GRPO 是更好的选择，因为它更简单、更稳定、显存占用更低。
+
+### 11.4.2 GRPO训练实战
+
+GRPO 训练的前提是已经完成 SFT 训练，因为 GRPO 需要一个合理的初始策略。
+
+基础 GRPO 训练示例:
+```python
+from hello_agents.tools import RLTrainingTool
+
+# 创建训练工具
+rl_tool = RLTrainingTool()
+
+# GRPO训练
+result = rl_tool.run({
+    # 训练配置
+    "action": "train",
+    "algorithm": "grpo",
+    
+    # 模型配置
+    "model_name": "./models/sft_full",  # 从SFT模型开始
+    "output_dir": "./models/grpo_model",
+    
+    # 数据配置
+    "max_samples": 100,     # 使用100个样本快速测试
+    
+    # 训练参数
+    "num_epochs": 3,
+    "batch_size": 4,
+    "learning_rate": 1e-5,  # GRPO学习率通常比SFT小
+    
+    # GRPO特定参数
+    "num_generations": 4,   # 每个问题生成4个答案
+    "kl_coef": 0.05,        # KL散度惩罚系数
+    
+    # LoRA配置
+    "use_lora": True,
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    
+    # 奖励函数配置
+    "reward_type": "accuracy",  # 使用准确率奖励
+})
+
+print(f"\n✓ 训练完成!")
+print(f"  - 模型保存路径: {result['model_path']}")
+print(f"  - 训练样本数: {result['num_samples']}")
+print(f"  - 训练轮数: {result['num_epochs']}")
+print(f"  - 平均奖励: {result['average_reward']:.4f}")
+```
+
+GRPO 有一些特定的参数需要理解和调优。
+
+**生成参数**：
++ num_generations: 每个问题生成多少个答案。越多越好，但计算成本也越高。典型值为 4-8。生成多个答案的目的是计算组内相对奖励，增加训练信号的多样性。
++ max_new_tokens: 每个答案最多生成多少个 token。太少可能截断答案，太多浪费计算。建议 256-512。
++ temperature: 生成温度，控制随机性。0 表示贪婪解码，1 表示标准采样。GRPO 建议 0.7-1.0，保持一定的探索性。
+
+**优化参数**：
++ learning_rate: GRPO 的学习率通常比 SFT 小，因为我们不想偏离 SFT 模型太远。建议 1e-5 到 5e-5。
++ kl_coef: KL 散度惩罚系数，控制策略更新的幅度。太小(0.01)可能导致策略偏离太远，太大(0.5)可能限制学习。建议 0.05-0.1。
++ clip_range: 策略比率裁剪范围，类似 PPO 的 epsilon。建议 0.2。
+
+**奖励参数**：
++ reward_type: 奖励函数类型，可以是"accuracy"、"length_penalty"、"step"或"combined"。
++ reward_config: 奖励函数的额外配置，如长度惩罚的目标长度、步骤奖励的系数等。
+
+完整的GRPO训练：
+```python
+from hello_agents.tools import RLTrainingTool
+
+rl_tool = RLTrainingTool()
+
+# 完整GRPO训练
+result = rl_tool.run({
+    "action": "train",
+    "algorithm": "grpo",
+
+    # 模型配置
+    "model_name": "./models/sft_full",
+    "output_dir": "./models/grpo_full",
+    
+    # 数据配置
+    "max_samples": None,    # 使用全部数据
+    
+    # 训练参数
+    "num_epochs": 3,
+    "batch_size": 4,
+    "learning_rate": 1e-5,
+    "warmup_ratio": 0.1,
+    
+    # GRPO特定参数
+    "num_generations": 4,
+    "max_new_tokens": 512,
+    "temperature": 0.8,
+    "kl_coef": 0.05,
+    "clip_range": 0.2,
+    
+    # LoRA配置
+    "use_lora": True,
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    
+    # 奖励函数配置
+    "reward_type": "combined",
+    "reward_config": {
+        "components": [
+            {"type": "accuracy", "weight": 1.0},
+            {"type": "length_penalty", "weight": 0.5, "target_length": 200},
+            {"type": "step", "weight": 0.3, "step_bonus": 0.1}
+        ]
+    },
+    
+    # 其他配置
+    "save_steps": 500,
+    "logging_steps": 100,
+})
+
+print(f"训练完成! 模型保存在: {result['model_path']}")
+```
+
+### 11.4.3 GRPO训练过程解析
+
+#### (1) 训练循环
+
+GRPO的训练循环包括以下步骤：
++ **采样阶段**:对于每个问题，使用当前策略生成多个答案(num_generations个)。这些答案构成一个"组"，用于计算相对奖励。
++ **策略更新**:使用相对奖励更新策略，同时添加 KL 散度惩罚，防止策略偏离参考模型太远。
++ **重复**:重复上述步骤，直到完成所有训练轮次。
++ **奖励计算**：对每个生成的答案计算奖励 $r_i$。奖励可以是准确率、长度惩罚、步骤奖励或它们的组合。
++ **相对奖励**：计算组内平均奖励 $\bar{r} = \frac{1}{N} \sum_{i=1}^{N} r_i$，然后计算相对奖励$\hat{r}_i = r_i - \bar{r}$。这样做的好处是减少奖励方差，使训练更稳定。
+
+```python
+# 假设我们有一个问题
+question = "What is 48 + 24?"
+
+# 生成4个答案
+answers = [
+    "48 + 24 = 72. Final Answer: 72",      # 正确
+    "48 + 24 = 72. Final Answer: 72",      # 正确
+    "48 + 24 = 70. Final Answer: 70",      # 错误
+    "Let me think... 72. Final Answer: 72" # 正确但冗长
+]
+
+# 计算奖励(假设使用准确率 + 长度惩罚)
+rewards = [1.0, 1.0, 0.0, 0.8]  # 第4个答案因为冗长被惩罚
+
+# 计算组内平均奖励
+avg_reward = (1.0 + 1.0 + 0.0 + 0.8) / 4 = 0.7
+
+# 计算相对奖励
+relative_rewards = [
+    1.0 - 0.7 = 0.3,   # 正确且简洁,相对奖励为正
+    1.0 - 0.7 = 0.3,   # 正确且简洁,相对奖励为正
+    0.0 - 0.7 = -0.7,  # 错误,相对奖励为负
+    0.8 - 0.7 = 0.1    # 正确但冗长,相对奖励较小
+]
+
+# 策略更新:增加前两个答案的概率,减少第三个答案的概率
+```
+
+#### (2) KL散度惩罚
+
+KL 散度惩罚是 GRPO 的关键组成部分，它防止策略偏离参考模型太远。KL 散度定义为：
+
+$$
+D_{KL}(\pi_\theta || \pi_{\text{ref}}) = \mathbb{E}_{s, a \sim \pi_\theta} \left[ \log \frac{\pi_\theta(a|s)}{\pi_{\text{ref}}(a|s)} \right]
+$$
+
+在实践中，我们计算每个 token 的 KL 散度，然后求和：
+
+$$
+D_{KL} = \sum_{t=1}^{T} \log \frac{\pi_\theta(a_t|s, a_{<t})}{\pi_{\text{ref}}(a_t|s, a_{<t})}
+$$
+
+KL 散度越大，说明当前策略与参考模型差异越大。通过添加 KL 散度惩罚项 $-\beta \cdot D_{KL}$，
+我们限制策略更新的幅度，避免"遗忘"SFT 阶段学到的知识。
+
+kl_coef($\beta$)的选择很重要:
 
 
 
