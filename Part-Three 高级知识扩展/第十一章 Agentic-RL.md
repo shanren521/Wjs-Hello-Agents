@@ -1085,13 +1085,285 @@ KL 散度越大，说明当前策略与参考模型差异越大。通过添加 K
 我们限制策略更新的幅度，避免"遗忘"SFT 阶段学到的知识。
 
 kl_coef($\beta$)的选择很重要:
++ 太小(0.01):策略可能偏离太远，导致输出格式混乱或质量下降
++ 太大(0.5):策略更新受限，学习缓慢，难以超越 SFT 模型
++ 建议(0.05-0.1):平衡探索和稳定性
+
+#### (3) 训练监控
+在 GRPO 训练过程中，我们需要监控以下指标:
++ **平均奖励(Average Reward)**:应该逐渐上升。如果奖励不上升，可能是学习率太小、KL 惩罚太大、奖励函数设计不合理。如果奖励先升后降，可能是过拟合或奖励崩塌。
++ **KL 散度(KL Divergence)**:应该保持在合理范围内(0.01-0.1)。如果 KL 散度过大(>0.5)，说明策略偏离太远，需要增大 kl_coef 或降低学习率。如果 KL 散度过小(<0.001)，说明策略几乎没有更新，需要减小 kl_coef 或增大学习率。
++ **准确率(Accuracy)**:应该逐渐提升。这是最直观的指标，反映模型的实际能力。 
++ **生成质量(Generation Quality)**:需要人工检查生成的答案，确保格式正确、推理清晰。
+
+HelloAgents 集成了两种主流的训练监控工具:Weights & Biases(wandb)和 TensorBoard。
+
+**方式 1:使用 Weights & Biases(推荐)**
+
+```python
+import os
+
+# 1. 设置wandb(需要先注册账号: https://wandb.ai)
+os.environ["WANDB_PROJECT"] = "hello-agents-grpo"  # 项目名称
+os.environ["WANDB_LOG_MODEL"] = "false"            # 不上传模型文件
+
+# 2. 在训练配置中启用wandb
+result = rl_tool.run({
+    "action": "train",
+    "algorithm": "grpo",
+    "model_name": "Qwen/Qwen3-0.6B",
+    "output_dir": "./models/grpo_monitored",
+    "num_epochs": 2,
+    "batch_size": 2,
+    "use_lora": True,
+    # wandb会自动记录所有训练指标
+})
+
+# 训练完成后,访问 https://wandb.ai 查看训练曲线
+```
+
+wandb 会自动记录以下指标:
++ train/reward: 平均奖励
++ train/kl: KL 散度
++ train/loss: 训练损失
++ train/learning_rate: 学习率
++ train/epoch: 训练轮数
+
+**方式 2:使用 TensorBoard**
+TensorBoard 是 TensorFlow 提供的可视化工具，也支持 PyTorch 训练。
+
+```python
+# 1. 训练时会自动在output_dir下创建tensorboard日志
+result = rl_tool.run({
+    "action": "train",
+    "algorithm": "grpo",
+    "model_name": "Qwen/Qwen3-0.6B",
+    "output_dir": "./models/grpo_tb",
+    "num_epochs": 2,
+    "batch_size": 2,
+    "use_lora": True,
+})
+
+# 2. 启动TensorBoard查看训练曲线
+# 在命令行运行:
+# tensorboard --logdir=./models/grpo_tb
+# 然后访问 http://localhost:6006
+```
+
+**方式 3:离线监控(无需外部工具)**
+
+```python
+# 训练过程会打印详细日志
+result = rl_tool.run({
+    "action": "train",
+    "algorithm": "grpo",
+    "model_name": "Qwen/Qwen3-0.6B",
+    "output_dir": "./models/grpo_simple",
+    "num_epochs": 2,
+    "batch_size": 2,
+    "use_lora": True,
+})
+
+# 日志示例:
+# Epoch 1/2 | Step 100/500 | Reward: 0.45 | KL: 0.023 | Loss: 1.234
+# Epoch 1/2 | Step 200/500 | Reward: 0.52 | KL: 0.031 | Loss: 1.156
+# ...
+```
+
+在 GRPO 训练中，可能会遇到一些问题。当奖励不上升时，可能是学习率太小或 KL 惩罚太大限制了策略更新，也可能是奖励函数设计不合理或 SFT 模型质量太差，此时可以增大学习率(从 1e-5 到 5e-5)、减小 kl_coef(从 0.1 到 0.05)、检查奖励函数或重新训练 SFT 模型。
+
+当 KL 散度爆炸(超过 0.5 甚至 1.0)导致生成答案格式混乱时，通常是学习率太大或 KL 惩罚太小，或者奖励函数过于激进，可以降低学习率(从 5e-5 到 1e-5)、增大 kl_coef(从 0.05 到 0.1)、调整奖励函数或使用梯度裁剪。
+
+当生成质量下降(准确率提升但格式混乱、推理不清晰)时，可能是奖励函数只关注准确率忽略了其他质量指标，或 KL 惩罚太小导致模型偏离 SFT 太远，或出现过拟合，此时应使用组合奖励函数同时优化多个指标、增大 kl_coef 保持一致性、减少训练轮数或增加训练数据。
+
+GRPO 训练的显存占用比 SFT 高，因为需要同时生成多个答案并存储参考模型输出，容易出现 OOM。可以通过减小 num_generations(从 8 到 4)、batch_size(从 4 到 2)或 max_new_tokens(从 512 到 256)，或使用梯度检查点和混合精度训练来缓解。
+
+## 11.5 模型评估与分析
+
+### 11.5.1 评估指标体系
+将评估指标分为三类:准确性指标、效率指标、质量指标
+
+#### (1) 准确性指标
+
+准确性指标衡量模型是否能够得出正确答案。
+**准确率(Accuracy)**:最基本的指标，答案完全正确的比例。计算公式为:
+$$
+\text{Accuracy} = \frac{\text{正确答案数}}{\text{总问题数}}
+$$
+
+**优点**是简单直观，易于理解和比较。**缺点**是无法区分"接近正确"和"完全错误",对于复杂任务可能过于粗糙。
+
+**Top-K 准确率**:生成 K 个答案，只要有一个正确就算对。计算公式为:
+$$
+\text{Accuracy@K} = \frac{\text{至少有一个正确答案的问题数}}{\text{总问题数}}
+$$
+
+指标反映了模型的"潜力"，即通过多次采样能否找到正确答案。
+
+**数值误差(Numerical Error)**:对于数学问题，可以计算预测值与真实值的误差。计算公式为:
+$$
+\text{Error} = \frac{1}{N} \sum_{i=1}^{N} |y_i - \hat{y}_i|
+$$
+
+指标可以区分"接近正确"(如预测 72.5，真实 72)和"完全错误"(如预测 100，真实 72)。
+
+#### (2) 效率指标
+效率指标衡量模型生成答案的成本。
+
+**平均长度(Average Length)**:生成答案的平均 token 数。计算公式为:
+$$
+\text{Avg Length} = \frac{1}{N} \sum_{i=1}^{N} |y_i|
+$$
+
+更短的答案意味着更低的推理成本和更快的响应速度。
+
+**推理步骤数(Reasoning Steps)**:答案中包含的推理步骤数量。计算公式为:
+$$
+\text{Avg Steps} = \frac{1}{N} \sum_{i=1}^{N} s_i
+$$
+
+**推理时间(Inference Time)**:生成一个答案所需的时间。这个指标在实际部署中很重要，影响用户体验。
+
+#### (3) 质量指标
+质量指标衡量答案的可读性和可解释性。
+
+**格式正确率(Format Correctness)**:答案是否符合预期格式(如包含"Step 1"， "Final Answer"等标记)。计算公式为:
+$$
+\text{Format Correctness} = \frac{\text{格式正确的答案数}}{\text{总答案数}}
+$$
+
+**推理连贯性(Reasoning Coherence)**:推理步骤之间是否逻辑连贯。这个指标通常需要人工评估或使用专门的评估模型。
+
+**可解释性(Explainability)**:答案是否容易理解和验证。包含清晰步骤的答案比直接给出结果的答案更具可解释性。
+
+![评估指标对比.png](../images/评估指标对比.png)
+
+### 11.5.2 评估实战
+HelloAgents 提供了全面的评估功能，可以一次性计算多个指标。
+```python
+from hello_agents.tools import RLTrainingTool
+
+rl_tool = RLTrainingTool()
+
+# 全面评估
+print("=" * 50)
+print("全面评估GRPO模型")
+print("=" * 50)
+
+result = rl_tool.run({
+    "action": "evaluate",
+    "model_path": "./models/grpo_full",
+    "max_samples": 200,
+    "use_lora": True,
+    
+    # 评估配置
+    "metrics": [
+        "accuracy",           # 准确率
+        "accuracy_at_k",      # Top-K准确率
+        "average_length",     # 平均长度
+        "average_steps",      # 平均步骤数
+        "format_correctness", # 格式正确率
+    ],
+    "k": 3,  # Top-3准确率
+})
+
+# 解析结果
+eval_data = json.loads(result)
+
+# 打印结果
+print(f"\n评估结果:")
+print(f"  准确率: {eval_data['accuracy']}")
+print(f"  平均奖励: {eval_data['average_reward']}")
+print(f"  测试样本数: {eval_data['num_samples']}")
+```
+
+### 11.5.3 错误分析
+模型的错误可以分为四类:
++ 计算错误(推理步骤正确但计算出错如"48/2=25"，说明数值计算能力不足)
++ 推理错误(推理逻辑错误导致解题思路不对，如先加后除而非先除后加，说明逻辑推理能力不足)
++ 理解错误(没有正确理解问题，如问题问"总共"但只计算了一部分，说明语言理解能力不足)
++ 格式错误(答案正确但格式不符合要求，如缺少"Final Answer:"标记，说明格式学习不足)
+
+### 11.5.4 改进方向
+
+![模型改进迭代流程.png](../images/模型改进迭代流程.png)
+
+持续迭代的过程:训练模型 → 评估性能 → 分析错误 → 确定问题 → 选择改进方向 → 重新训练
+
+## 11.6完整训练流程实战
+
+### 11.6.1 端到端训练流程
+
+![Agentic RL端到端训练流程.png](../images/Agentic%20RL端到端训练流程.png)
+
+```python
+"""
+完整的Agentic RL训练流程
+从数据准备到模型部署的端到端示例
+"""
+
+from hello_agents.tools import RLTrainingTool
+import json
+from datetime import datetime
+
+class AgenticRLPipeline:
+    """Agentic RL训练流水线"""
+    
+    def __init__(self, config_path="config.json"):
+        """
+        初始化训练流水线
+        
+        Args:
+            config_path: 配置文件路径
+        """
+        self.rl_tool = RLTrainingTool()
+        self.config = self.load_config(config_path)
+        self.results = {}
+
+    def load_config(self, config_path):
+        """加载配置文件"""
+        with open(config_path, "r") as f:
+            return json.load(f)
+
+    def log(self, message):
+        """记录日志"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] {message}")
+
+    def stage1_prepare_data(self):
+        """阶段1: 数据准备"""
+        self.log("=" * 50)
+        self.log("阶段1: 数据准备")
+        self.log("=" * 50)
+        
+        # 加载并检查数据集
+        result = self.rl_tool.run({
+            "action": "load_dataset",
+            "format": "sft",
+            "max_samples": self.config["data"]["max_samples"]
+        })
+
+        # 解析JSON结果
+        dataset_info = json.loads(result)
+
+        self.log(f"✓ 数据集加载完成")
+        self.log(f"  - 样本数: {dataset_info['dataset_size']}")
+        self.log(f"  - 格式: {dataset_info['format']}")
+        self.log(f"  - 数据列: {', '.join(dataset_info['sample_keys'])}")
+
+        self.results["data"] = dataset_info
+
+        return dataset_info
+
+    
+```
+
+从小规模开始:不要一开始就用全部数据训练。先用 100-1000 个样本快速迭代，验证流程和参数，确认效果后再扩大规模。这样可以节省大量时间和计算资源
+
+**数据质量检查**:在训练前检查数据质量，确保格式正确、答案准确、没有重复样本。
 
 
-
-
-
-
-
+**数据增强**:如果数据量不足，可以考虑数据增强，如改写问题(保持答案不变)、生成相似问题、反向翻译(translate back)。但要注意保持数据质量，避免引入噪声。
 
 
 
