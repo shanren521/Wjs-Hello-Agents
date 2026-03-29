@@ -1362,8 +1362,415 @@ class AgenticRLPipeline:
 
 **数据质量检查**:在训练前检查数据质量，确保格式正确、答案准确、没有重复样本。
 
-
 **数据增强**:如果数据量不足，可以考虑数据增强，如改写问题(保持答案不变)、生成相似问题、反向翻译(translate back)。但要注意保持数据质量，避免引入噪声。
+
+### 11.6.2 超参数调优
+
+#### (1) 网络搜索
+
+网格搜索(Grid Search)是最简单的调优方法，遍历所有参数组合，选择最佳的一组。
+
+```python
+# 定义参数网格
+param_grid = {
+    "learning_rate": [1e-5, 5e-5, 1e-4],
+    "lora_rank": [8, 16, 32],
+    "kl_coef": [0.05, 0.1, 0.2],
+}
+best_accuracy = 0
+best_params = None
+
+# 遍历所有组合
+for lr in param_grid["learning_rate"]:
+    for rank in param_grid["lora_rank"]:
+        for kl in param_grid["kl_coef"]:
+            print(f"测试参数: lr={lr}, rank={rank}, kl={kl}")
+
+            # 训练模型
+            result = rl_tool.run({
+                "action": "train",
+                "algorithm": "grpo",
+                "learning_rate": lr,
+                "lora_rank": rank,
+                "kl_coef": kl,
+                # 其他参数...
+            })
+
+            # 评估模型
+            eval_result = rl_tool.run({
+                "action": "evaluate",
+                "model_path": result["model_path"],
+            })
+
+            # 更新最佳参数
+            if eval_result["accuracy"] > best_accuracy:
+                best_accuracy = eval_result["accuracy"]
+                best_params = {"lr": lr, "rank": rank, "kl": kl}
+
+print(f"最佳参数: {best_params}")
+print(f"最佳准确率: {best_accuracy:.2%}")
+```
+
+网格搜索的**优点**是简单直接，能找到全局最优。**缺点**是计算成本高，参数多时不可行。
+
+#### (2) 随机搜索
+
+随机搜索(Random Search)随机采样参数组合，比网格搜索更高效。
+
+```python
+import random
+
+# 定义参数范围
+param_ranges = {
+    "learning_rate": (1e-6, 1e-4),  # 对数均匀分布
+    "lora_rank": [4, 8, 16, 32, 64],
+    "kl_coef": (0.01, 0.5),
+}
+
+best_accuracy = 0
+best_params = None
+
+# 随机采样N次
+N = 10
+for i in range(N):
+    # 随机采样参数
+    lr = 10 ** random.uniform(-6, -4)  # 对数均匀
+    rank = random.choice(param_ranges["lora_rank"])
+    kl = random.uniform(0.01, 0.5)
+
+    print(f"[{i+1}/{N}] 测试参数: lr={lr:.2e}, rank={rank}, kl={kl:.3f}")
+
+    # 训练和评估(同上)
+    # ...
+
+print(f"最佳参数: {best_params}")
+print(f"最佳准确率: {best_accuracy:.2%}")
+```
+
+随机搜索的**优点**是效率高，适合参数空间大的情况。**缺点**是可能错过最优解。
+
+#### (3) 贝叶斯优化
+
+贝叶斯优化(Bayesian Optimization)使用概率模型指导搜索，更加智能。可以使用 Optuna 等库:
+
+```python
+import optuna
+
+def objective(trial):
+    """优化目标函数"""
+    # 采样参数
+    lr = trial.suggest_loguniform("learning_rate", 1e-6, 1e-4)
+    rank = trial.suggest_categorical("lora_rank", [8, 16, 32])
+    kl = trial.suggest_uniform("kl_coef", 0.01, 0.5)
+
+    # 训练模型
+    result = rl_tool.run({
+        "action": "train",
+        "algorithm": "grpo",
+        "learning_rate": lr,
+        "lora_rank": rank,
+        "kl_coef": kl,
+        # 其他参数...
+    })
+
+    # 评估模型
+    eval_result = rl_tool.run({
+        "action": "evaluate",
+        "model_path": result["model_path"],
+    })
+
+    return eval_result["accuracy"]
+
+# 创建研究
+study = optuna.create_study(direction="maximize")
+study.optimize(objective, n_trials=20)
+
+# 打印最佳参数
+print(f"最佳参数: {study.best_params}")
+print(f"最佳准确率: {study.best_value:.2%}")
+```
+
+贝叶斯优化的**优点**是样本效率高，能快速找到好的参数。**缺点**是实现复杂，需要额外的库。
+
+![超参数调优方法对比.png](../images/超参数调优方法对比.png)
+
+### 11.6.3 分布式训练
+
+当数据量和模型规模增大时，单 GPU 训练会变得非常缓慢。这时我们需要使用分布式训练来加速训练过程。HelloAgents 基于 TRL 和 Hugging Face Accelerate，天然支持多 GPU 和多节点分布式训练
+
+方案选择建议:
+
++ 单机多卡(2-8 卡): 使用 DDP，简单高效
++ 大模型(>7B): 使用 DeepSpeed ZeRO-2 或 ZeRO-3
++ 多节点集群: 使用 DeepSpeed ZeRO-3 + Offload
+
+#### (1) 配置Accelerate
+创建Accelerate配置文件
+```bash
+accelerate config
+```
+
+#### (2) 使用DDP训练
+
+数据并行(DDP)是最简单的分布式方案，每个 GPU 持有完整模型副本，数据被分割到各个 GPU 上。
+
+Accelerate 配置文件
+```yaml
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+num_processes: 4  # GPU数量
+machine_rank: 0
+num_machines: 1
+gpu_ids: all
+mixed_precision: fp16
+```
+
+启动训练
+```bash
+# 使用配置文件
+accelerate launch --config_file multi_gpu_ddp.yaml train_script.py
+
+# 或者直接指定参数
+accelerate launch --num_processes 4 --mixed_precision fp16 train_script.py
+```
+
+#### (3) 使用DeepSpeed ZeRO训练
+
+DeepSpeed ZeRO通过分片优化器状态、梯度和模型参数，大幅降低显存占用，支持更大的模型和 batch size。
+
+
+ZeRO-2 配置文件:
+```yaml
+compute_environment: LOCAL_MACHINE
+distributed_type: DEEPSPEED
+num_processes: 4
+machine_rank: 0
+num_machines: 1
+gpu_ids: all
+mixed_precision: fp16
+deepspeed_config:
+  gradient_accumulation_steps: 4
+  gradient_clipping: 1.0
+  offload_optimizer_device: none
+  offload_param_device: none
+  zero3_init_flag: false
+  zero_stage: 2  # ZeRO-2
+```
+
+ZeRO-3 配置文件:
+```yaml
+compute_environment: LOCAL_MACHINE
+distributed_type: DEEPSPEED
+num_processes: 4
+machine_rank: 0
+num_machines: 1
+gpu_ids: all
+mixed_precision: fp16
+deepspeed_config:
+  gradient_accumulation_steps: 4
+  gradient_clipping: 1.0
+  offload_optimizer_device: cpu  # 优化器状态卸载到CPU
+  offload_param_device: cpu      # 参数卸载到CPU
+  zero3_init_flag: true
+  zero_stage: 3  # ZeRO-3
+```
+
+#### (4) 多节点训练
+对于超大规模训练，可以使用多个节点(机器)。
+
+主节点配置:
+```yaml
+compute_environment: LOCAL_MACHINE
+distributed_type: DEEPSPEED
+num_processes: 16  # 4节点 x 4GPU
+machine_rank: 0    # 主节点
+num_machines: 4
+main_process_ip: 192.168.1.100  # 主节点IP
+main_process_port: 29500
+gpu_ids: all
+mixed_precision: fp16
+deepspeed_config:
+  zero_stage: 3
+  offload_optimizer_device: cpu
+  offload_param_device: cpu
+```
+
+工作节点配置 (修改machine_rank为 1, 2, 3):
+```yaml
+machine_rank: 1  # 工作节点1
+# 其他配置相同
+```
+
+#### (5) 分布式训练最佳实践
+
+**1. Batch Size 调整**
+分布式训练时，总 batch size = per_device_batch_size × num_gpus × gradient_accumulation_steps
+
+**2. 学习率缩放**
+使用线性缩放规则: lr_new = lr_base × sqrt(total_batch_size_new / total_batch_size_base)
+
+### 11.6.4 生产部署
+
+#### (1) 模型导出
+将 LoRA 权重合并到基础模型，方便部署:
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+
+# 加载基础模型
+base_model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B")
+
+# 加载LoRA权重
+model = PeftModel.from_pretrained(base_model, "./models/grpo_model")
+
+# 合并权重
+merged_model = model.merge_and_unload()
+
+# 保存合并后的模型
+merged_model.save_pretrained("./models/merged_model")
+
+# 保存tokenizer
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+tokenizer.save_pretrained("./models/merged_model")
+
+print("✓ 模型已导出到: ./models/merged_model")
+```
+
+#### (2) 推理优化
+使用量化和优化技术加速推理:
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+# 加载模型(使用8-bit量化)
+model = AutoModelForCausalLM.from_pretrained(
+    "./models/merged_model",
+    load_in_8bit=True,  # 8-bit量化
+    device_map="auto",  # 自动分配设备
+)
+
+tokenizer = AutoTokenizer.from_pretrained("./models/merged_model")
+
+# 推理
+def generate_answer(question):
+    prompt = f"<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=512,
+        temperature=0.7,
+        do_sample=True,
+    )
+
+    response = tokenizer.decode(outputs[0], skip_special_tokens=False)
+    return response
+
+# 测试
+question = "What is 48 + 24?"
+answer = generate_answer(question)
+print(answer)
+```
+
+#### (3) API服务
+使用 FastAPI 创建推理服务:
+```python
+from fastapi import FastAPI
+from pydantic import BaseModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+app = FastAPI()
+
+# 加载模型
+model = AutoModelForCausalLM.from_pretrained("./models/merged_model")
+tokenizer = AutoTokenizer.from_pretrained("./models/merged_model")
+
+class Question(BaseModel):
+    text: str
+    max_tokens: int = 512
+
+class Answer(BaseModel):
+    text: str
+    confidence: float
+
+@app.post("/generate", response_model=Answer)
+def generate(question: Question):
+    """生成答案"""
+    prompt = f"<|im_start|>user\n{question.text}<|im_end|>\n<|im_start|>assistant\n"
+    inputs = tokenizer(prompt, return_tensors="pt")
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=question.max_tokens,
+        temperature=0.7,
+        return_dict_in_generate=True,
+        output_scores=True,
+    )
+
+    response = tokenizer.decode(outputs.sequences[0], skip_special_tokens=False)
+
+    # 计算置信度(简化版)
+    confidence = 0.8  # 实际应该基于输出概率计算
+
+    return Answer(text=response, confidence=confidence)
+
+# 运行: uvicorn api:app --host 0.0.0.0 --port 8000
+```
+
+## 11.7 总结
+
+#### (1) Agentic RL 的本质
+
+Agentic RL 是将 LLM 作为可学习策略，嵌入到智能体的感知-决策-执行循环中，通过强化学习优化智能体在多步任务中的表现。它与传统的 PBRFT(Preference-Based Reinforcement Fine-Tuning)的核心区别在于:
+
++ 任务性质:从单轮对话优化扩展到多步序贯决策
++ 状态空间:从静态提示扩展到动态演化的环境状态
++ 行动空间:从纯文本生成扩展到文本+工具+环境操作
++ 奖励设计:从单步质量评估扩展到长期累积回报
++ 优化目标:从短期响应质量扩展到长期任务成功
+
+#### (2) 六大核心能力
+
+Agentic RL 旨在提升智能体的六大核心能力:
+
++ 推理(Reasoning):多步逻辑推导，学习推理策略
++ 工具使用(Tool Use):API/工具调用，学会何时用、如何用
++ 记忆(Memory):长期信息保持，学习记忆管理
++ 规划(Planning):行动序列规划，学会动态规划
++ 自我改进(Self-Improvement):自我反思优化，从错误中学习
++ 感知(Perception):多模态理解，视觉推理和工具使用
+
+#### (3) 训练流程
+
+完整的 Agentic RL 训练流程包括:
+
++ 预训练(Pretraining):在大规模文本上学习语言知识(通常使用现成的预训练模型)
++ 监督微调(SFT):学习任务格式和基础推理能力
++ 强化学习(RL):通过试错优化推理策略，超越训练数据质量
+
+SFT 是基础，RL 是提升。没有 SFT 的基础，RL 很难成功;没有 RL 的优化，模型只能模仿训练数据。
+
+**深入学习Agentic RL路径：**
+
+**基础阶段**
+
++ 强化学习基础:学习 MDP、策略梯度、PPO 等基本概念
++ LLM 基础:了解 Transformer、预训练、微调等技术
++ 实践 HelloAgents:运行本章的示例代码，理解完整流程
+
+**进阶阶段**
+
++ 深入 TRL:学习 TRL 库的实现，理解 SFT 和 GRPO 等算法的细节
++ 自定义数据集:使用自己的数据集训练模型
++ 自定义奖励函数:设计适合自己任务的奖励函数
++ 参数调优:系统地调优超参数，提升模型性能
+
+**高级阶段**
+
+**多步推理**:研究长序列推理任务
+**工具学习**:让智能体学会使用工具
+**多智能体**:研究多智能体协作
+
 
 
 
