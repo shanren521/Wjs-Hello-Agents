@@ -210,6 +210,138 @@ async def get_npc_memories(npc_name: str, limit: int = 10):
             detail=f"获取记忆列表失败：{str(e)}"
         )
 
+@app.delete("/npcs/{npc_name}/memories")
+async def clear_npc_memories(npc_name: str, memory_type: str = None):
+    """清空NPC的记忆(用于测试)
+    Args:
+        npc_name: NPC名称
+        memory_type: 记忆类型(working/episodic)，不指定则清空所有
+    Returns:
+        操作结果
+    """
+    npc_mgr, _ = get_managers()
+
+    # 验证NPC是否存在
+    npc_info = npc_mgr.get_npc_info(npc_name)
+    if not npc_info:
+        raise HTTPException(
+            status_code=404,
+            detail=f"NPC {npc_name} 不存在"
+        )
+
+    try:
+        npc_mgr.clear_npc_memories(npc_name, memory_type)
+        return {
+            "message": f"已清空{npc_name}的{memory_type}记忆",
+            "npc_name": npc_name,
+            "memory_type": memory_type or "all"
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"清空记忆失败：{str(e)}"
+        )
+
+@app.get("/npcs/{npc_name}/affinity")
+async def get_npc_affinity(npc_name: str, player_id: str = "player"):
+    """获取NPC对玩家的好感度
+    Args:
+        npc_name: NPC名称
+        player_id: 玩家ID，默认为"player"
+    Returns:
+        NPC对玩家的好感度
+    """
+
+    npc_mgr, _ = get_managers()
+
+    # 验证NPC是否存在
+    npc_info = npc_mgr.get_npc_info(npc_name)
+    if not npc_info:
+        raise HTTPException(
+            status_code=404,
+            detail=f"NPC {npc_name} 不存在"
+        )
+
+    try:
+        affinity_info = npc_mgr.get_npc_affinity(npc_name, player_id)
+        return {
+            "npc_name": npc_name,
+            "player_id": player_id,
+            **affinity_info
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"获取好感度失败：{str(e)}"
+        )
+
+@app.get("/affinities")
+async def get_all_affinities(player_id: str = "player"):
+    """获取所有NPC对玩家的好感度
+    Args：
+        player_id: 玩家ID(默认为"player")
+    Returns:
+        所有NPC对玩家的好感度
+    """
+    npc_mgr, _ = get_managers()
+
+    try:
+        affinities = npc_mgr.get_all_affinities(player_id)
+        return {
+            "player_id": player_id,
+            "affinities": affinities
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"获取所有NPC对玩家的好感度失败：{str(e)}"
+        )
+
+@app.put("/npcs/{npc_name}/affinity")
+async def set_npc_affinity(npc_name: str, affinity: float, player_id: str = "player"):
+    """设置NPC对玩家的好感度(用于测试)
+    Args:
+        npc_name: NPC名称
+        affinity: 好感度值
+        player_id: 玩家ID，默认为"player"
+
+    Returns:
+        操作结果
+    """
+
+    npc_mgr, _ = get_managers()
+
+    # 验证NPC是否存在
+    npc_info = npc_mgr.get_npc_info(npc_name)
+    if not npc_info:
+        raise HTTPException(
+            status_code=404,
+            detail=f"NPC {npc_name} 不存在"
+        )
+
+    # 验证好感度范围
+    if affinity < 0 or affinity > 100:
+        raise HTTPException(
+            status_code=400,
+            detail="好感度值必须在0到100之间"
+        )
+
+    # 更新NPC好感度
+    try:
+        npc_mgr.set_npc_affinity(npc_name, affinity, player_id)
+        affinity_info = npc_mgr.get_npc_affinity(npc_name, player_id)
+        return {
+            "message": f"已设置{npc_name}对{player_id}的好感度为{affinity}",
+            "npc_name": npc_name,
+            "player_id": player_id,
+            **affinity_info
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"设置好感度失败：{str(e)}"
+        )
 
 
 # ============================主程序入口=========================
