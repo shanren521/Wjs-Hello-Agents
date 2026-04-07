@@ -374,6 +374,90 @@ class NPCAgentManager:
 
                 })
             return memory_list
+        except Exception as e:
+            print(f"获取记忆列表失败：{str(e)}")
+            return []
+
+    def clear_npc_memory(self, npc_name: str, memory_type: Optional[str] = None):
+        """清空NPC的记忆"""
+        if npc_name not in self.memories:
+            return
+        memory_manager = self.memories[npc_name]
+        if not memory_manager:
+            return
+        try:
+            if memory_type:
+                # 清空指定类型的记忆
+                memory_manager.clear_memory_type(memory_type)
+            else:
+                # 清空所有记忆
+                for mem_type in ["working", "episodic"]:
+                    try:
+                        memory_manager.clear_memory_type(mem_type)
+                    except:
+                        pass
+        except Exception as e:
+            print(f"清空记忆失败：{str(e)}")
+
+    def get_npc_affinity(self, npc_name: str, player_id: str = "player") -> Dict:
+        """获取NPC的好感度
+        Args:
+            npc_name: NPC名称
+            player_id: 玩家ID，默认为"player"
+        Returns:
+            NPC对玩家的好感度
+        """
+        if not self.relationship_manager:
+            return {
+                "affinity": 50.0,
+                "level": "熟悉",
+                "modifier": "礼貌友善,正常交流,保持专业"
+            }
+        affinity = self.relationship_manager.get_affinity(npc_name, player_id)
+        level = self.relationship_manager.get_affinity_level(affinity)
+        modifier = self.relationship_manager.get_affinity_modifier(affinity)
+
+        return {
+            "affinity": affinity,
+            "level": level,
+            "modifier": modifier
+        }
+
+    def get_all_affinities(self, player_id: str = "player") -> Dict[str, Dict]:
+        """获取所有NPC对玩家的好感度
+        Args:
+            player_id: 玩家ID，默认为"player"
+        Returns:
+            所有NPC对玩家的好感度
+        """
+        if not self.relationship_manager:
+            return {}
+
+        return self.relationship_manager.get_all_affinities(player_id)
+
+    def set_npc_affinity(self, npc_name: str, affinity: float, player_id: str = "player"):
+        """设置NPC对玩家的好感度(用于测试)
+        Args:
+            npc_name: NPC名称
+            affinity: 好感度值
+            player_id: 玩家ID，默认为"player"
+        """
+        if not self.relationship_manager:
+            return
+
+        self.relationship_manager.set_affinity(npc_name, affinity, player_id)
+        level = self.relationship_manager.get_affinity_level(affinity)
+        print(f"✅ 已设置{npc_name}对玩家的好感度: {affinity:.1f} ({level})")
+
+# 全局单例
+_npc_manager = None
+
+def get_npc_manager() -> NPCAgentManager:
+    """获取NPC管理器单例"""
+    global _npc_manager
+    if _npc_manager is None:
+        _npc_manager = NPCAgentManager()
+    return _npc_manager
 
 
 
