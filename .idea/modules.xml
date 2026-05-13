@@ -2,6 +2,8 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
+      <module fileurl="file://$PROJECT_DIR$/../AI-Agent/.idea/AI-Agent.iml" filepath="$PROJECT_DIR$/../AI-Agent/.idea/AI-Agent.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../AI-Agent/AI_AGENT_LEARN/.idea/AI_AGENT_LEARN.iml" filepath="$PROJECT_DIR$/../AI-Agent/AI_AGENT_LEARN/.idea/AI_AGENT_LEARN.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/Wjs-Hello-Agents.iml" filepath="$PROJECT_DIR$/.idea/Wjs-Hello-Agents.iml" />
     </modules>
   </component>
