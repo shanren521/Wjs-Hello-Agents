@@ -7,4 +7,8 @@
     <orderEntry type="module" module-name="AI-Agent" />
     <orderEntry type="module" module-name="AI_AGENT_LEARN" />
   </component>
+  <component name="PyDocumentationSettings">
+    <option name="format" value="GOOGLE" />
+    <option name="myDocStringFormat" value="Google" />
+  </component>
 </module>
